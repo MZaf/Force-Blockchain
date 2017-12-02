@@ -11,7 +11,7 @@
 #include "init.h"
 #include "miner.h"
 #include "kernel.h"
-
+#ifdef ENABLE_WALLET
 #include <boost/assign/list_of.hpp>
 
 using namespace json_spirit;
