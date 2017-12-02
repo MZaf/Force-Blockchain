@@ -49,6 +49,192 @@ Value getsubsidy(const Array& params, bool fHelp)
     return (int64_t)GetProofOfStakeReward(pindexBest->pprev, 0, 0);
 }
 
+
+
+Value getgenerate(const Value& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getgenerate\n"
+            "\nReturn if the server is set to generate coins or not. The default is false.\n"
+            "It is set with the command line argument -gen (or " + std::string(BITCOIN_CONF_FILENAME) + " setting gen)\n"
+            "It can also be set with the setgenerate call.\n"
+            "\nResult\n"
+            "true|false      (boolean) If the server is set to generate coins or not\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getgenerate", "")
+            + HelpExampleRpc("getgenerate", "")
+        );
+
+    LOCK(cs_main);
+    return GetBoolArg("-gen", DEFAULT_GENERATE);
+}
+
+Value generate(const Value& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 1)
+        throw runtime_error(
+            "generate numblocks\n"
+            "\nMine blocks immediately (before the RPC call returns)\n"
+            "\nNote: this function can only be used on the regtest network\n"
+            "\nArguments:\n"
+            "1. numblocks    (numeric, required) How many blocks are generated immediately.\n"
+            "\nResult\n"
+            "[ blockhashes ]     (array) hashes of blocks generated\n"
+            "\nExamples:\n"
+            "\nGenerate 11 blocks\n"
+            + HelpExampleCli("generate", "11")
+        );
+
+    if (!Params().MineBlocksOnDemand())
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "This method can only be used on regtest");
+
+    int nHeightStart = 0;
+    int nHeightEnd = 0;
+    int nHeight = 0;
+    int nGenerate = params[0].get_int();
+
+    boost::shared_ptr<CReserveScript> coinbaseScript;
+    GetMainSignals().ScriptForMining(coinbaseScript);
+
+    // If the keypool is exhausted, no script is returned at all.  Catch this.
+    if (!coinbaseScript)
+        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, "Error: Keypool ran out, please call keypoolrefill first");
+
+    //throw an error if no script was provided
+    if (coinbaseScript->reserveScript.empty())
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "No coinbase script available (mining requires a wallet)");
+
+    {   // Don't keep cs_main locked
+        LOCK(cs_main);
+        nHeightStart = chainActive.Height();
+        nHeight = nHeightStart;
+        nHeightEnd = nHeightStart+nGenerate;
+    }
+    unsigned int nExtraNonce = 0;
+    Value blockHashes(Value::VARR);
+    while (nHeight < nHeightEnd)
+    {
+        auto_ptr<CBlockTemplate> pblocktemplate(CreateNewBlock(Params(), coinbaseScript->reserveScript));
+        if (!pblocktemplate.get())
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
+        CBlock *pblock = &pblocktemplate->block;
+        {
+            LOCK(cs_main);
+            IncrementExtraNonce(pblock, chainActive.Tip(), nExtraNonce);
+        }
+        while (!CheckProofOfWork(pblock->GetHash(), pblock->nBits, Params().GetConsensus())) {
+            // Yes, there is a chance every nonce could fail to satisfy the -regtest
+            // target -- 1 in 2^(2^32). That ain't gonna happen.
+            ++pblock->nNonce;
+        }
+        CValidationState state;
+        if (!ProcessNewBlock(state, Params(), NULL, pblock, true, NULL))
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "ProcessNewBlock, block not accepted");
+        ++nHeight;
+        blockHashes.push_back(pblock->GetHash().GetHex());
+
+        //mark script as important because it was used at least for one coinbase output
+        coinbaseScript->KeepScript();
+    }
+    return blockHashes;
+}
+
+
+Value setgenerate(const Value& params, bool fHelp)
+{
+    if (fHelp || params.size() < 1 || params.size() > 2)
+        throw runtime_error(
+            "setgenerate generate ( genproclimit )\n"
+            "\nSet 'generate' true or false to turn generation on or off.\n"
+            "Generation is limited to 'genproclimit' processors, -1 is unlimited.\n"
+            "See the getgenerate call for the current setting.\n"
+            "\nArguments:\n"
+            "1. generate         (boolean, required) Set to true to turn on generation, false to turn off.\n"
+            "2. genproclimit     (numeric, optional) Set the processor limit for when generation is on. Can be -1 for unlimited.\n"
+            "\nExamples:\n"
+            "\nSet the generation on with a limit of one processor\n"
+            + HelpExampleCli("setgenerate", "true 1") +
+            "\nCheck the setting\n"
+            + HelpExampleCli("getgenerate", "") +
+            "\nTurn off generation\n"
+            + HelpExampleCli("setgenerate", "false") +
+            "\nUsing json rpc\n"
+            + HelpExampleRpc("setgenerate", "true, 1")
+        );
+
+    if (Params().MineBlocksOnDemand())
+        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Use the generate method instead of setgenerate on this network");
+
+    bool fGenerate = true;
+    if (params.size() > 0)
+        fGenerate = params[0].get_bool();
+
+    int nGenProcLimit = GetArg("-genproclimit", DEFAULT_GENERATE_THREADS);
+    if (params.size() > 1)
+    {
+        nGenProcLimit = params[1].get_int();
+        if (nGenProcLimit == 0)
+            fGenerate = false;
+    }
+
+    mapArgs["-gen"] = (fGenerate ? "1" : "0");
+    mapArgs ["-genproclimit"] = itostr(nGenProcLimit);
+    GenerateBitcoins(fGenerate, nGenProcLimit, Params());
+
+    return NullUniValue;
+}
+
+Value getmininginfo(const Value& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getmininginfo\n"
+            "\nReturns a json object containing mining-related information."
+            "\nResult:\n"
+            "{\n"
+            "  \"blocks\": nnn,             (numeric) The current block\n"
+            "  \"currentblocksize\": nnn,   (numeric) The last block size\n"
+            "  \"currentblocktx\": nnn,     (numeric) The last block transaction\n"
+            "  \"difficulty\": xxx.xxxxx    (numeric) The current difficulty\n"
+            "  \"errors\": \"...\"          (string) Current errors\n"
+            "  \"generate\": true|false     (boolean) If the generation is on or off (see getgenerate or setgenerate calls)\n"
+            "  \"genproclimit\": n          (numeric) The processor limit for generation. -1 if no generation. (see getgenerate or setgenerate calls)\n"
+            "  \"pooledtx\": n              (numeric) The size of the mem pool\n"
+            "  \"testnet\": true|false      (boolean) If using testnet or not\n"
+            "  \"chain\": \"xxxx\",         (string) current network name as defined in BIP70 (main, test, regtest)\n"
+            "}\n"
+            "\nExamples:\n"
+            + HelpExampleCli("getmininginfo", "")
+            + HelpExampleRpc("getmininginfo", "")
+        );
+
+
+    LOCK(cs_main);
+
+    UniValue obj(UniValue::VOBJ);
+    obj.push_back(Pair("blocks",           (int)chainActive.Height()));
+    obj.push_back(Pair("currentblocksize", (uint64_t)nLastBlockSize));
+    obj.push_back(Pair("currentblocktx",   (uint64_t)nLastBlockTx));
+    obj.push_back(Pair("difficulty",       (double)GetDifficulty()));
+    obj.push_back(Pair("errors",           GetWarnings("statusbar")));
+    obj.push_back(Pair("genproclimit",     (int)GetArg("-genproclimit", DEFAULT_GENERATE_THREADS)));
+    obj.push_back(Pair("networkhashps",    getnetworkhashps(params, false)));
+    obj.push_back(Pair("pooledtx",         (uint64_t)mempool.size()));
+    obj.push_back(Pair("testnet",          Params().TestnetToBeDeprecatedFieldRPC()));
+    obj.push_back(Pair("chain",            Params().NetworkIDString()));
+    obj.push_back(Pair("generate",         getgenerate(params, false)));
+    return obj;
+}
+
+
+
+
+
+
+
+
+
 Value getstakesubsidy(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() != 1)
